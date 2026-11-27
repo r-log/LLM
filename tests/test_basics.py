@@ -77,3 +77,55 @@ def test_model_is_causal():
     a, _ = m(x)
     b, _ = m(y)
     assert torch.allclose(a[0, :10], b[0, :10], atol=1e-5)  # the past didn't see it
+
+
+def _small(**kw):
+    torch.manual_seed(0)
+    return GPT(GPTConfig(vocab_size=257, block_size=64, n_layer=2, n_head=2, n_embd=32, **kw)).eval()
+
+
+def test_standard_flops_unchanged():
+    # The baseline budgets depend on this number; it must never drift.
+    m = GPT(GPTConfig(vocab_size=257, block_size=512, n_layer=6, n_head=6, n_embd=384))
+    assert abs(m.flops_per_token() - 7.140e7) / 7.140e7 < 1e-3
+
+
+def test_full_window_equals_standard_attention():
+    a, b = _small(), _small(local_window=64)
+    b.load_state_dict(a.state_dict())
+    x = torch.randint(0, 257, (2, 64))
+    assert torch.allclose(a(x)[0], b(x)[0], atol=1e-5)
+
+
+def test_window_and_memory_are_causal():
+    for kw in ({"local_window": 16}, {"local_window": 16, "mem_chunk": 4}):
+        m = _small(**kw)
+        x = torch.randint(0, 257, (1, 64))
+        y = x.clone()
+        y[0, 40:] = (y[0, 40:] + 1) % 257
+        assert torch.allclose(m(x)[0][0, :40], m(y)[0][0, :40], atol=1e-5), kw
+
+
+def test_window_forgets_and_memory_remembers():
+    # Change byte 2. At position 60 it is 58 positions back: outside a 16-wide window.
+    x = torch.randint(0, 257, (1, 64))
+    y = x.clone()
+    y[0, 2] = (y[0, 2] + 1) % 257
+    win = _small(local_window=16)
+    assert torch.allclose(win(x)[0][0, 60], win(y)[0][0, 60], atol=1e-5)  # window alone: forgotten
+    mem = _small(local_window=16, mem_chunk=4)
+    assert not torch.allclose(mem(x)[0][0, 60], mem(y)[0][0, 60], atol=1e-5)  # memory: still felt
+    # No gap: at t=18 byte 2 has just left the raw window, and its chunk (0-3) is already visible.
+    # One layer only: with more layers, information also hops forward window by window.
+    torch.manual_seed(0)
+    win1 = GPT(GPTConfig(vocab_size=257, block_size=64, n_layer=1, n_head=2, n_embd=32, local_window=16)).eval()
+    mem1 = GPT(GPTConfig(vocab_size=257, block_size=64, n_layer=1, n_head=2, n_embd=32, local_window=16, mem_chunk=4)).eval()
+    assert torch.allclose(win1(x)[0][0, 18], win1(y)[0][0, 18], atol=1e-5)
+    assert not torch.allclose(mem1(x)[0][0, 18], mem1(y)[0][0, 18], atol=1e-5)
+
+
+def test_flops_ordering():
+    def f(**kw):
+        return GPT(GPTConfig(vocab_size=257, block_size=2048, n_layer=6, n_head=6, n_embd=384, **kw)).flops_per_token()
+    full, win, mem = f(), f(local_window=512), f(local_window=512, mem_chunk=4)
+    assert win < mem < full

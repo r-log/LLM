@@ -19,6 +19,7 @@
 #   BLOCK_SIZE        context length override (default: the preset's)
 #   BATCH_SIZE        sequences per step (default 32)
 #   FLOPS             fixed budget per run; skips the speed test (use it to match earlier runs)
+#   MODEL_ARGS        extra train.py arguments, e.g. "--local-window 512 --mem-chunk 4"
 #   TAG               added to run names, e.g. TAG=-ctx2048 -> bytes-small-ctx2048-s1
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -34,7 +35,7 @@ BLOCK_SIZE=${BLOCK_SIZE:-}
 BATCH_SIZE=${BATCH_SIZE:-32}
 FLOPS=${FLOPS:-}
 TAG=${TAG:-}
-EXTRA="--batch-size $BATCH_SIZE${BLOCK_SIZE:+ --block-size $BLOCK_SIZE}"
+EXTRA="--batch-size $BATCH_SIZE${BLOCK_SIZE:+ --block-size $BLOCK_SIZE} ${MODEL_ARGS:-}"
 say() { echo; echo "=== $(date '+%H:%M:%S') $* ==="; }
 
 say "1/5 install and test"

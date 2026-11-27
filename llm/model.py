@@ -6,6 +6,11 @@
 - input and output embeddings share weights ("tied")
 - causal attention via PyTorch's fused scaled_dot_product_attention
 
+Optional (off by default):
+- local_window W: each position attends only to the last W positions (sliding window)
+- mem_chunk k (needs local_window): positions older than the window are still visible,
+  but compressed: every k consecutive positions are averaged into one key/value
+
 Shapes in comments: B = batch, T = sequence length, C = model width,
 H = number of heads, D = C // H (width per head).
 """
@@ -28,6 +33,38 @@ class GPTConfig:
     n_head: int = 6
     n_embd: int = 384
     dropout: float = 0.0
+    local_window: int | None = None  # None = full causal attention
+    mem_chunk: int = 0  # 0 = no compressed memory
+
+
+def attention_layout(T: int, window: int, chunk: int, device) -> torch.Tensor:
+    """Boolean mask (T, T + T//chunk): which keys each position may attend to.
+
+    Columns 0..T-1 are the raw positions: visible if inside the last `window` positions.
+    Columns T.. are compressed chunks (chunk j covers positions j*chunk .. j*chunk+chunk-1):
+    visible once the chunk starts at least `window` positions back. Since chunk <= window,
+    a visible chunk lies entirely in the past, so this stays causal.
+    """
+    t = torch.arange(T, device=device)[:, None]
+    p = torch.arange(T, device=device)[None, :]
+    raw = (p <= t) & (p > t - window)
+    if not chunk:
+        return raw
+    j = torch.arange(T // chunk, device=device)[None, :]
+    mem = j * chunk <= t - window
+    return torch.cat([raw, mem], dim=1)
+
+
+def avg_attended(T: int, window: int | None, chunk: int) -> float:
+    """Average number of keys a position attends to (used for the FLOP count)."""
+    if window is None:
+        return T / 2
+    total = 0
+    for t in range(T):
+        total += min(t + 1, window)
+        if chunk and t >= window:
+            total += min((t - window) // chunk + 1, T // chunk)
+    return total / T
 
 
 class RMSNorm(nn.Module):
@@ -65,15 +102,38 @@ class Attention(nn.Module):
         self.qkv = nn.Linear(cfg.n_embd, 3 * cfg.n_embd, bias=False)
         self.proj = nn.Linear(cfg.n_embd, cfg.n_embd, bias=False)
         self.dropout = cfg.dropout
+        self.window, self.chunk = cfg.local_window, cfg.mem_chunk
+        if self.chunk:
+            assert self.window and self.chunk <= self.window, "mem_chunk needs local_window >= mem_chunk"
+        self._mask = {}
 
     def forward(self, x, cos, sin):
         B, T, C = x.shape
         q, k, v = self.qkv(x).split(C, dim=2)
         q, k, v = (t.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) for t in (q, k, v))
-        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-        y = F.scaled_dot_product_attention(
-            q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0.0
-        )
+        dp = self.dropout if self.training else 0.0
+        if self.window is None:
+            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=dp)
+        else:
+            key = (T, x.device)
+            if key not in self._mask:
+                self._mask[key] = attention_layout(T, self.window, self.chunk, x.device)
+            mask = self._mask[key]
+            if self.chunk:
+                assert T % self.chunk == 0, f"sequence length {T} must be a multiple of mem_chunk {self.chunk}"
+                M = T // self.chunk
+                # Compress: average each chunk's (un-rotated) keys and values, then give the
+                # chunk the position of its last byte for RoPE.
+                k_mem = k.view(B, self.n_head, M, self.chunk, -1).mean(3)
+                v_mem = v.view(B, self.n_head, M, self.chunk, -1).mean(3)
+                last = torch.arange(M, device=x.device) * self.chunk + self.chunk - 1
+                k_mem = apply_rope(k_mem, cos[last], sin[last])
+                q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+                k, v = torch.cat([k, k_mem], dim=2), torch.cat([v, v_mem], dim=2)
+            else:
+                q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dp)
         return self.proj(y.transpose(1, 2).contiguous().view(B, T, C))
 
 
@@ -137,8 +197,11 @@ class GPT(nn.Module):
         cfg = self.cfg
         T = T or cfg.block_size
         n = self.num_params(non_embedding=True) + cfg.vocab_size * cfg.n_embd  # + lm_head matmul
-        attn = 12 * cfg.n_layer * cfg.n_embd * T  # QK^T and attn*V, fwd+bwd (PaLM formula)
-        return 6 * n + attn / 2  # /2: causal, each token only attends to half the window on average
+        # QK^T and attn*V, fwd+bwd: 12 * layers * width per attended key (PaLM formula).
+        # Full causal attention attends to T/2 keys on average. With a local window or
+        # compressed memory, we count the keys actually used by the design (masked-out
+        # work in our simple implementation is not counted, as an efficient kernel skips it).
+        return 6 * n + 12 * cfg.n_layer * cfg.n_embd * avg_attended(T, cfg.local_window, cfg.mem_chunk)
 
     def forward(self, idx, targets=None):
         """idx: (B, T) token ids. Returns logits (B, T, V), and the mean loss if targets given.

@@ -57,6 +57,8 @@ def parse_args():
     ap.add_argument("--n-layer", type=int, help="override the preset's number of layers")
     ap.add_argument("--n-head", type=int, help="override the preset's number of attention heads")
     ap.add_argument("--n-embd", type=int, help="override the preset's width")
+    ap.add_argument("--local-window", type=int, help="sliding attention window (default: full causal attention)")
+    ap.add_argument("--mem-chunk", type=int, default=0, help="compress positions older than the window, this many per slot")
     budget = ap.add_mutually_exclusive_group(required=True)
     budget.add_argument("--flops", type=float, help="training compute budget")
     budget.add_argument("--steps", type=int, help="fixed number of optimizer steps")
@@ -116,7 +118,7 @@ def main():
     n_layer, n_head, n_embd, block = PRESETS[args.preset]
     cfg = GPTConfig(vocab_size=tok.vocab_size, block_size=args.block_size or block,
                     n_layer=args.n_layer or n_layer, n_head=args.n_head or n_head,
-                    n_embd=args.n_embd or n_embd)
+                    n_embd=args.n_embd or n_embd, local_window=args.local_window, mem_chunk=args.mem_chunk)
     model = GPT(cfg).to(device)
 
     tokens_per_step = args.batch_size * args.grad_accum * cfg.block_size
