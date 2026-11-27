@@ -54,6 +54,9 @@ def parse_args():
     ap.add_argument("--tokenizer", choices=["bytes", "gpt2"], required=True)
     ap.add_argument("--preset", choices=PRESETS, default="small")
     ap.add_argument("--block-size", type=int, help="override the preset's context length")
+    ap.add_argument("--n-layer", type=int, help="override the preset's number of layers")
+    ap.add_argument("--n-head", type=int, help="override the preset's number of attention heads")
+    ap.add_argument("--n-embd", type=int, help="override the preset's width")
     budget = ap.add_mutually_exclusive_group(required=True)
     budget.add_argument("--flops", type=float, help="training compute budget")
     budget.add_argument("--steps", type=int, help="fixed number of optimizer steps")
@@ -112,7 +115,8 @@ def main():
     tok = get_tokenizer(args.tokenizer)
     n_layer, n_head, n_embd, block = PRESETS[args.preset]
     cfg = GPTConfig(vocab_size=tok.vocab_size, block_size=args.block_size or block,
-                    n_layer=n_layer, n_head=n_head, n_embd=n_embd)
+                    n_layer=args.n_layer or n_layer, n_head=args.n_head or n_head,
+                    n_embd=args.n_embd or n_embd)
     model = GPT(cfg).to(device)
 
     tokens_per_step = args.batch_size * args.grad_accum * cfg.block_size
