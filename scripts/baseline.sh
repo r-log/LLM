@@ -16,6 +16,10 @@
 #   TOKENIZERS        default "gpt2 bytes"
 #   DATA              default data/fineweb-edu (anything else must already be prepared)
 #   COMPILE           default --compile (set to "" to turn off)
+#   BLOCK_SIZE        context length override (default: the preset's)
+#   BATCH_SIZE        sequences per step (default 32)
+#   FLOPS             fixed budget per run; skips the speed test (use it to match earlier runs)
+#   TAG               added to run names, e.g. TAG=-ctx2048 -> bytes-small-ctx2048-s1
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -26,6 +30,11 @@ SEEDS=${SEEDS:-"1 2 3"}
 TOKENIZERS=${TOKENIZERS:-"gpt2 bytes"}
 DATA=${DATA:-data/fineweb-edu}
 COMPILE=${COMPILE:---compile}
+BLOCK_SIZE=${BLOCK_SIZE:-}
+BATCH_SIZE=${BATCH_SIZE:-32}
+FLOPS=${FLOPS:-}
+TAG=${TAG:-}
+EXTRA="--batch-size $BATCH_SIZE${BLOCK_SIZE:+ --block-size $BLOCK_SIZE}"
 say() { echo; echo "=== $(date '+%H:%M:%S') $* ==="; }
 
 say "1/5 install and test"
@@ -42,8 +51,11 @@ else
 fi
 
 say "3/5 speed test"
+if [ -n "$FLOPS" ]; then
+  echo "FLOPS=$FLOPS given, skipping the speed test"
+else
 python scripts/train.py --data "$DATA" --tokenizer "$FIRST_TOK" --preset "$PRESET" --steps 150 \
-  --eval-every 100000 $COMPILE --no-save --name speedtest > /dev/null
+  --eval-every 100000 $COMPILE $EXTRA --no-save --name speedtest > /dev/null
 FLOPS=$(python - "$MINUTES_PER_RUN" "$MAX_FLOPS" <<'EOF'
 import json, sys
 minutes, max_flops = float(sys.argv[1]), float(sys.argv[2])
@@ -57,22 +69,23 @@ print(f"{tok_s:,.0f} tokens/s = {flops_s / 1e12:.1f} TFLOP/s achieved -> budget 
 print(f"{budget:.3e}")
 EOF
 )
+fi
 echo "using --flops $FLOPS (byte runs may take a bit longer or shorter than the target)"
 
 say "4/5 training"
 for s in $SEEDS; do
   for tok in $TOKENIZERS; do
-    name="$tok-$PRESET-s$s"
+    name="$tok-$PRESET$TAG-s$s"
     if [ -f "runs/$name/final.json" ]; then echo "$name done, skipping"; continue; fi
     say "train $name"
     python scripts/train.py --data "$DATA" --tokenizer "$tok" --preset "$PRESET" \
-      --flops "$FLOPS" --seed "$s" $COMPILE --name "$name" --log-every 50
+      --flops "$FLOPS" --seed "$s" $COMPILE $EXTRA --name "$name" --log-every 50
   done
 done
 
 say "5/5 summary"
-python scripts/evaluate.py --summary runs/*-"$PRESET"-s*/ | tee "baseline_summary_$PRESET.txt"
-for f in runs/*-"$PRESET"-s*/final.json; do
+python scripts/evaluate.py --summary runs/*-"$PRESET"*-s*/ | tee "baseline_summary_$PRESET$TAG.txt"
+for f in runs/*-"$PRESET"*-s*/final.json; do
   python -c "import json,sys; r=json.load(open('$f')); print(f\"{'$f'.split('/')[1]:24s} time {r['train_time_s']/60:6.1f} min   bytes/token {r['clean']['bytes_per_token']:.2f}\")"
 done
 say "ALL DONE - you can stop the pod now (files in /workspace are kept)"
