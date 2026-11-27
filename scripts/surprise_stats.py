@@ -134,7 +134,7 @@ def main():
     print("\nBY CONTEXT (position inside the window)")
     res["by_context"] = {}
     T = model.cfg.block_size
-    edges = [0, 8, 32, 128, 512, 2048, 8192]
+    edges = [0, 8, 32, 128, 512, 2048, 8192, 32768]
     for lo, hi in zip(edges, edges[1:]):
         if lo >= T:
             break

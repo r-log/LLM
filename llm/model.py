@@ -55,6 +55,19 @@ def attention_layout(T: int, window: int, chunk: int, device) -> torch.Tensor:
     return torch.cat([raw, mem], dim=1)
 
 
+def block_layout(W: int, nb: int, M: int, chunk: int, device) -> torch.Tensor:
+    """Mask (nb, W, 2W + M) for blocked attention: query block i holds positions i*W .. i*W+W-1
+    and sees raw keys i*W-W .. i*W+W-1 (the previous block and its own), then M memory slots."""
+    i = torch.arange(nb, device=device)[:, None, None]
+    t = i * W + torch.arange(W, device=device)[None, :, None]
+    p = i * W - W + torch.arange(2 * W, device=device)[None, None, :]
+    raw = (p >= 0) & (p <= t) & (p > t - W)
+    if not M:
+        return raw
+    j = torch.arange(M, device=device)[None, None, :]
+    return torch.cat([raw, (j * chunk <= t - W).expand(nb, W, M)], dim=2)
+
+
 def avg_attended(T: int, window: int | None, chunk: int) -> float:
     """Average number of keys a position attends to (used for the FLOP count)."""
     if window is None:
@@ -95,6 +108,8 @@ def apply_rope(x, cos, sin):
 
 
 class Attention(nn.Module):
+    blocked = True  # windowed attention block by block (efficient); False = one big masked attention
+
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         assert cfg.n_embd % cfg.n_head == 0
@@ -116,24 +131,46 @@ class Attention(nn.Module):
             q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=dp)
         else:
-            key = (T, x.device)
-            if key not in self._mask:
-                self._mask[key] = attention_layout(T, self.window, self.chunk, x.device)
-            mask = self._mask[key]
+            W, H, D = self.window, self.n_head, C // self.n_head
+            M = 0
             if self.chunk:
                 assert T % self.chunk == 0, f"sequence length {T} must be a multiple of mem_chunk {self.chunk}"
                 M = T // self.chunk
                 # Compress: average each chunk's (un-rotated) keys and values, then give the
                 # chunk the position of its last byte for RoPE.
-                k_mem = k.view(B, self.n_head, M, self.chunk, -1).mean(3)
-                v_mem = v.view(B, self.n_head, M, self.chunk, -1).mean(3)
+                k_mem = k.view(B, H, M, self.chunk, D).mean(3)
+                v_mem = v.view(B, H, M, self.chunk, D).mean(3)
                 last = torch.arange(M, device=x.device) * self.chunk + self.chunk - 1
                 k_mem = apply_rope(k_mem, cos[last], sin[last])
-                q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-                k, v = torch.cat([k, k_mem], dim=2), torch.cat([v, v_mem], dim=2)
+            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+            if self.blocked and T % W == 0:
+                # Block by block: each block of W queries only needs 2W raw keys (+ memory),
+                # instead of all T. Same result as the big masked attention, less work.
+                nb = T // W
+                key = ("blocked", T, x.device)
+                if key not in self._mask:
+                    self._mask[key] = block_layout(W, nb, M, self.chunk, x.device)
+                mask = self._mask[key]
+                kb = F.pad(k, (0, 0, W, 0)).unfold(2, 2 * W, W).transpose(-1, -2)  # (B,H,nb,2W,D)
+                vb = F.pad(v, (0, 0, W, 0)).unfold(2, 2 * W, W).transpose(-1, -2)
+                if M:
+                    kb = torch.cat([kb, k_mem[:, :, None].expand(B, H, nb, M, D)], dim=3)
+                    vb = torch.cat([vb, v_mem[:, :, None].expand(B, H, nb, M, D)], dim=3)
+                S = kb.size(3)
+                # Fold the blocks into the batch: (B*nb, H, W or S, D)
+                fold = lambda t, L: t.permute(0, 2, 1, 3, 4).reshape(B * nb, H, L, D)  # noqa: E731
+                yb = F.scaled_dot_product_attention(
+                    fold(q.view(B, H, nb, W, D), W), fold(kb, S), fold(vb, S),
+                    attn_mask=mask[None, :, None].expand(B, nb, 1, W, S).reshape(B * nb, 1, W, S),
+                    dropout_p=dp)
+                y = yb.view(B, nb, H, W, D).permute(0, 2, 1, 3, 4).reshape(B, H, T, D)
             else:
-                q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dp)
+                key = (T, x.device)
+                if key not in self._mask:
+                    self._mask[key] = attention_layout(T, W, self.chunk, x.device)
+                if M:
+                    k, v = torch.cat([k, k_mem], dim=2), torch.cat([v, v_mem], dim=2)
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=self._mask[key], dropout_p=dp)
         return self.proj(y.transpose(1, 2).contiguous().view(B, T, C))
 
 

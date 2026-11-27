@@ -148,3 +148,23 @@ def test_sliding_eval_gives_more_context():
     _, pos_slide, _ = per_token_nats(Uniform(257, 64), docs, tok, stride=16)
     assert pos_slide.float().mean() > pos_plain.float().mean()
     assert pos_slide[64:].min() >= 64 - 16  # after the first window: at least T - S context
+
+
+def test_blocked_attention_matches_masked_attention():
+    from llm.model import Attention
+    x = torch.randint(0, 257, (2, 64))
+    for kw in ({"local_window": 16}, {"local_window": 16, "mem_chunk": 4}, {"local_window": 8, "mem_chunk": 8}):
+        m = _small(**kw)
+        try:
+            Attention.blocked = True
+            a, _ = m(x)
+            Attention.blocked = False
+            b, _ = m(x)
+        finally:
+            Attention.blocked = True
+        assert torch.allclose(a, b, atol=1e-5), kw
+    # gradients flow the same way too
+    m = _small(local_window=16, mem_chunk=4).train()
+    _, loss = m(x, x)
+    loss.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in m.parameters())

@@ -14,7 +14,9 @@
 #   PRESET            model size preset (default small)
 #   SEEDS             default "1 2 3"
 #   TOKENIZERS        default "gpt2 bytes"
-#   DATA              default data/fineweb-edu (anything else must already be prepared)
+#   SOURCE            prepare_data.py source (default fineweb-edu; pg19 = long books)
+#   TRAIN_BYTES       how much training text to prepare (default 3e9)
+#   DATA              default data/$SOURCE
 #   COMPILE           default --compile (set to "" to turn off)
 #   BLOCK_SIZE        context length override (default: the preset's)
 #   BATCH_SIZE        sequences per step (default 32)
@@ -29,7 +31,9 @@ MAX_FLOPS=${MAX_FLOPS:-1e17}
 PRESET=${PRESET:-small}
 SEEDS=${SEEDS:-"1 2 3"}
 TOKENIZERS=${TOKENIZERS:-"gpt2 bytes"}
-DATA=${DATA:-data/fineweb-edu}
+SOURCE=${SOURCE:-fineweb-edu}
+TRAIN_BYTES=${TRAIN_BYTES:-3e9}
+DATA=${DATA:-data/$SOURCE}
 COMPILE=${COMPILE:---compile}
 BLOCK_SIZE=${BLOCK_SIZE:-}
 BATCH_SIZE=${BATCH_SIZE:-32}
@@ -48,7 +52,7 @@ FIRST_TOK=${TOKENIZERS%% *}
 if [ -f "$DATA/meta.json" ] && [ -f "$DATA/train_$FIRST_TOK.bin" ]; then
   echo "already prepared, skipping"
 else
-  python scripts/prepare_data.py --source fineweb-edu --train-bytes 3e9
+  python scripts/prepare_data.py --source "$SOURCE" --train-bytes "$TRAIN_BYTES" --tokenizers "${TOKENIZERS// /,}"
 fi
 
 say "3/5 speed test"
