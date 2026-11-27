@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 wandb/
+baseline.log
+baseline_summary_*.txt
