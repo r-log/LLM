@@ -48,8 +48,15 @@ def build_eval_stream(docs: list[str], tokenizer) -> tuple[torch.Tensor, torch.T
 
 
 @torch.no_grad()
-def per_token_nats(model, docs: list[str], tokenizer, device="cpu", batch_size: int = 16):
+def per_token_nats(model, docs: list[str], tokenizer, device="cpu", batch_size: int = 16,
+                   stride: int | None = None):
     """The loss (in nats) of every document token, in text order.
+
+    stride=None: windows don't overlap (fast; tokens at the start of each window have
+    little context). stride=S < block_size: "sliding" evaluation. Windows start every S
+    positions and only their last S targets are scored (the first window scores all), so
+    every token after the first window gets at least block_size - S positions of context.
+    Each token is still scored exactly once.
 
     Returns (nats, window_pos, n_bytes): nats[i] is the loss of the i-th document token,
     window_pos[i] is how many positions of context it had inside its window.
@@ -58,8 +65,11 @@ def per_token_nats(model, docs: list[str], tokenizer, device="cpu", batch_size: 
     model.eval()
     ids, mask, n_bytes = build_eval_stream(docs, tokenizer)
     T = model.cfg.block_size
-    # Inputs are ids[s : s+T], targets are ids[s+1 : s+T+1]. Windows don't overlap.
-    starts = list(range(0, len(ids) - 1, T))
+    S = stride or T
+    assert 0 < S <= T, f"stride {S} must be between 1 and block_size {T}"
+    # Inputs are ids[s : s+T], targets are ids[s+1 : s+T+1].
+    # Window k scores targets at window positions >= T - S (window 0 scores all of them).
+    starts = [0] + list(range(S, max(len(ids) - 1 - (T - S), S), S))
     out_nats, out_pos = [], []
     for b in range(0, len(starts), batch_size):
         xs, ys = [], []
@@ -67,6 +77,8 @@ def per_token_nats(model, docs: list[str], tokenizer, device="cpu", batch_size: 
             x = ids[s : s + T]
             y = ids[s + 1 : s + T + 1].clone()
             y[~mask[s + 1 : s + T + 1]] = -1  # never score separators
+            if s > 0:
+                y[: T - S] = -1  # already scored by the previous window
             pad = T - len(x)
             if pad:  # last window: pad the input, ignore the padded targets
                 x = F.pad(x, (0, pad), value=tokenizer.eot_id)
@@ -91,9 +103,10 @@ def per_token_nats(model, docs: list[str], tokenizer, device="cpu", batch_size: 
     return nats, window_pos, n_bytes
 
 
-def bits_per_byte(model, docs: list[str], tokenizer, device="cpu", batch_size: int = 16) -> dict:
+def bits_per_byte(model, docs: list[str], tokenizer, device="cpu", batch_size: int = 16,
+                  stride: int | None = None) -> dict:
     """Score `model` on `docs`. Returns bits per byte plus the raw totals behind it."""
-    nats, _, n_bytes = per_token_nats(model, docs, tokenizer, device, batch_size)
+    nats, _, n_bytes = per_token_nats(model, docs, tokenizer, device, batch_size, stride)
     total_nats, n_scored = nats.double().sum().item(), len(nats)
     return {
         "bpb": total_nats / (math.log(2) * n_bytes),

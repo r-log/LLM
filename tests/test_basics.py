@@ -129,3 +129,22 @@ def test_flops_ordering():
         return GPT(GPTConfig(vocab_size=257, block_size=2048, n_layer=6, n_head=6, n_embd=384, **kw)).flops_per_token()
     full, win, mem = f(), f(local_window=512), f(local_window=512, mem_chunk=4)
     assert win < mem < full
+
+
+def test_sliding_eval_scores_every_token_once():
+    tok = ByteTokenizer()
+    docs = DOCS + ["another document " * 20]
+    for block, stride in ((64, 64), (64, 16), (64, 24), (64, 1), (1000, 100)):
+        r = bits_per_byte(Uniform(257, block), docs, tok, stride=stride)
+        assert r["tokens"] == sum(len(d.encode()) for d in docs), (block, stride)
+        assert math.isclose(r["bpb"], math.log2(257), rel_tol=1e-6)
+
+
+def test_sliding_eval_gives_more_context():
+    from llm.metrics import per_token_nats
+    tok = ByteTokenizer()
+    docs = ["x" * 500]
+    _, pos_plain, _ = per_token_nats(Uniform(257, 64), docs, tok)
+    _, pos_slide, _ = per_token_nats(Uniform(257, 64), docs, tok, stride=16)
+    assert pos_slide.float().mean() > pos_plain.float().mean()
+    assert pos_slide[64:].min() >= 64 - 16  # after the first window: at least T - S context

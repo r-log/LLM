@@ -30,10 +30,10 @@ def typo_docs(docs: list[str], rate: float) -> list[str]:
     return [add_typos(d, rate, seed=TYPO_SEED + i) for i, d in enumerate(docs)]
 
 
-def run_suite(model, tokenizer, docs: list[str], device="cpu") -> dict:
-    results = {"clean": bits_per_byte(model, docs, tokenizer, device)}
+def run_suite(model, tokenizer, docs: list[str], device="cpu", stride: int | None = None) -> dict:
+    results = {"clean": bits_per_byte(model, docs, tokenizer, device, stride=stride)}
     for rate in TYPO_RATES:
-        r = bits_per_byte(model, typo_docs(docs, rate), tokenizer, device)
+        r = bits_per_byte(model, typo_docs(docs, rate), tokenizer, device, stride=stride)
         r["degradation"] = r["bpb"] / results["clean"]["bpb"] - 1  # e.g. 0.12 = 12% worse
         results[f"typos_{rate}"] = r
     return results
