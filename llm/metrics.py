@@ -48,14 +48,19 @@ def build_eval_stream(docs: list[str], tokenizer) -> tuple[torch.Tensor, torch.T
 
 
 @torch.no_grad()
-def bits_per_byte(model, docs: list[str], tokenizer, device="cpu", batch_size: int = 16) -> dict:
-    """Score `model` on `docs`. Returns bits per byte plus the raw totals behind it."""
+def per_token_nats(model, docs: list[str], tokenizer, device="cpu", batch_size: int = 16):
+    """The loss (in nats) of every document token, in text order.
+
+    Returns (nats, window_pos, n_bytes): nats[i] is the loss of the i-th document token,
+    window_pos[i] is how many positions of context it had inside its window.
+    """
+    was_training = model.training
     model.eval()
     ids, mask, n_bytes = build_eval_stream(docs, tokenizer)
     T = model.cfg.block_size
     # Inputs are ids[s : s+T], targets are ids[s+1 : s+T+1]. Windows don't overlap.
     starts = list(range(0, len(ids) - 1, T))
-    total_nats, n_scored = 0.0, 0
+    out_nats, out_pos = [], []
     for b in range(0, len(starts), batch_size):
         xs, ys = [], []
         for s in starts[b : b + batch_size]:
@@ -72,12 +77,24 @@ def bits_per_byte(model, docs: list[str], tokenizer, device="cpu", batch_size: i
         x, y = torch.stack(xs).to(device), torch.stack(ys).to(device)
         with _autocast(device):
             logits, _ = model(x)
-        nll = F.cross_entropy(logits.float().view(-1, logits.size(-1)), y.reshape(-1), ignore_index=-1, reduction="sum")
-        total_nats += nll.item()
-        n_scored += (y != -1).sum().item()
+        nll = F.cross_entropy(logits.float().view(-1, logits.size(-1)), y.reshape(-1),
+                              ignore_index=-1, reduction="none").view(y.shape)
+        keep = y != -1
+        pos = torch.arange(T, device=y.device).expand_as(y)
+        out_nats.append(nll[keep].cpu())  # row-major order = text order
+        out_pos.append(pos[keep].cpu())
+    if was_training:
+        model.train()
+    nats, window_pos = torch.cat(out_nats), torch.cat(out_pos)
     # Sanity check: every document token was scored exactly once.
-    assert n_scored == int(mask.sum()), (n_scored, int(mask.sum()))
-    model.train()
+    assert len(nats) == int(mask.sum()), (len(nats), int(mask.sum()))
+    return nats, window_pos, n_bytes
+
+
+def bits_per_byte(model, docs: list[str], tokenizer, device="cpu", batch_size: int = 16) -> dict:
+    """Score `model` on `docs`. Returns bits per byte plus the raw totals behind it."""
+    nats, _, n_bytes = per_token_nats(model, docs, tokenizer, device, batch_size)
+    total_nats, n_scored = nats.double().sum().item(), len(nats)
     return {
         "bpb": total_nats / (math.log(2) * n_bytes),
         "nats": total_nats,
