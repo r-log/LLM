@@ -13,6 +13,10 @@ split), so it stays the same no matter how much training data you prepare later.
 
 Sources:
     fineweb-edu   HuggingFace FineWeb-Edu "sample-10BT" (needs internet; use on the GPU box)
+    code          repositories from scripts/build_code_corpus.py (data/code-raw/*.jsonl). Each
+                  repository becomes one document: its files in dependency order, each
+                  preceded by a 0x1C byte (ASCII file separator) and its path. Validation
+                  repositories are cut to their first --val-doc-bytes bytes.
     pg19          PG-19: Project Gutenberg books from before 1919, ~400 KB each (long-range
                   text). Validation comes from the official validation split.
     stdlib        English docstrings from Python's own standard library (works offline;
@@ -74,12 +78,34 @@ def pg19_docs(split: str):
         yield row["text"]
 
 
+FILE_SEP = "\x1c"
+
+
+def render_repo(rec: dict) -> str:
+    """One repository as one text: '<0x1C>path\n' + content for every file, in stored order."""
+    parts = []
+    for f in rec["files"]:
+        text = f["text"] if f["text"].endswith("\n") else f["text"] + "\n"
+        parts.append(f"{FILE_SEP}{f['path']}\n{text}")
+    return "".join(parts)
+
+
+def code_docs(split: str, raw_dir: str = "data/code-raw", max_bytes: int | None = None):
+    with open(Path(raw_dir) / f"{split}.jsonl", encoding="utf-8") as fh:
+        for line in fh:
+            doc = render_repo(json.loads(line))
+            if max_bytes:
+                doc = doc.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+            yield doc
+
+
 # source -> (default number of validation docs, validation iterator or None, train iterator)
 # With None, validation docs are taken from the start of the train iterator.
 SOURCES = {
     "fineweb-edu": (2000, None, fineweb_docs),
     "stdlib": (300, None, stdlib_docs),
     "pg19": (10, lambda: pg19_docs("validation"), lambda: pg19_docs("train")),
+    "code": (20, None, None),  # filled in main() (needs --code-raw and --val-doc-bytes)
 }
 
 
@@ -90,9 +116,14 @@ def main():
     ap.add_argument("--val-docs", type=int, default=None, help="default: 2000 (fineweb-edu), 300 (stdlib), 10 books (pg19)")
     ap.add_argument("--train-bytes", type=float, default=float("inf"), help="stop after this many training bytes")
     ap.add_argument("--out", default="data")
+    ap.add_argument("--code-raw", default="data/code-raw", help="input folder for --source code")
+    ap.add_argument("--val-doc-bytes", type=int, default=1_000_000, help="code: cut validation repos to this size")
     args = ap.parse_args()
 
     default_val, val_iter, train_iter = SOURCES[args.source]
+    if args.source == "code":
+        val_iter = lambda: code_docs("val", args.code_raw, args.val_doc_bytes)  # noqa: E731
+        train_iter = lambda: code_docs("train", args.code_raw)  # noqa: E731
     n_val = args.val_docs or default_val
     out = Path(args.out) / args.source
     out.mkdir(parents=True, exist_ok=True)
