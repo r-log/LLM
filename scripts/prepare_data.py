@@ -155,7 +155,7 @@ def main():
                 buffers[t.name].clear()
 
     for doc in docs:
-        if len(val) < n_val:
+        if val_iter is None and len(val) < n_val:  # with a separate validation split, never take train docs
             val.append(doc)
             continue
         if n_train_bytes >= args.train_bytes:
