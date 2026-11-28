@@ -21,15 +21,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
-from collections import Counter
 from pathlib import Path
 
 SOURCES = [
+    # The original repository is no longer public; up-to-date public forks carry the same
+    # license. The first one that can be cloned is used.
     {"name": "msvc-cpp-docs", "repo": "MicrosoftDocs/cpp-docs",
+     "mirrors": ["gcampbell-msft/cpp-docs", "MasoudAmiriBatmanghlnj/cpp-docs", "kermitdafrog8/cpp-docs"],
      "paths": ["docs/c-language", "docs/cpp", "docs/standard-library", "docs/c-runtime-library",
                "docs/preprocessor", "docs/build", "docs/code-quality"],
      "license": "CC-BY-4.0 (documentation), MIT (code samples)", "use": "open"},
@@ -45,16 +48,19 @@ TEXT_SUFFIXES = {".md", ".txt"}
 FRONT_MATTER = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
 
 
+GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}  # never ask for a password: fail instead
+
+
 def sparse_clone(repo: str, paths: list[str], dest: Path, url: str | None = None) -> None:
     """Shallow clone that only checks out `paths` (files or folders) and root LICENSE files."""
     if dest.exists():
         shutil.rmtree(dest)
     url = url or f"https://github.com/{repo}.git"
-    subprocess.run(["git", "clone", "--quiet", "--depth", "1", "--filter=blob:none", "--no-checkout", url, str(dest)],
-                   check=True)
+    run = lambda *a: subprocess.run(list(a), check=True, env=GIT_ENV, timeout=3600)  # noqa: E731
+    run("git", "clone", "--quiet", "--depth", "1", "--filter=blob:none", "--no-checkout", url, str(dest))
     patterns = ["/LICENSE*", "/license*"] + [f"/{p.strip('/')}" + ("" if Path(p).suffix else "/") for p in paths]
-    subprocess.run(["git", "-C", str(dest), "sparse-checkout", "set", "--no-cone", *patterns], check=True)
-    subprocess.run(["git", "-C", str(dest), "checkout", "--quiet"], check=True)
+    run("git", "-C", str(dest), "sparse-checkout", "set", "--no-cone", *patterns)
+    run("git", "-C", str(dest), "checkout", "--quiet")
 
 
 def clean(text: str) -> str:
@@ -89,29 +95,39 @@ def main():
 
     out = Path(args.out)
     (out / "licenses").mkdir(parents=True, exist_ok=True)
-    stats = Counter()
-    with open(out / "docs.jsonl", "w", encoding="utf-8") as fh:
+    stats = {}
+    tmp = out / "docs.jsonl.part"
+    with open(tmp, "w", encoding="utf-8") as fh:
         for src in SOURCES:
             if src["use"] != "open" and not args.allow_research_only:
                 print(f"skipping {src['name']} ({src['use']}; pass --allow-research-only to include)")
                 continue
             clone = out / "clones" / src["name"]
-            try:
-                sparse_clone(src["repo"], src["paths"], clone, overrides.get(src["repo"]))
-            except subprocess.CalledProcessError as e:
-                print(f"  failed to fetch {src['repo']}: {e}", file=sys.stderr)
+            fetched = None
+            for repo in [src["repo"], *src.get("mirrors", [])]:
+                print(f"fetching {src['name']} from {repo} ...", flush=True)
+                try:
+                    sparse_clone(repo, src["paths"], clone, overrides.get(repo))
+                    fetched = repo
+                    break
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                    print(f"  could not fetch {repo}: {type(e).__name__}", flush=True)
+            if fetched is None:
+                print(f"  skipping {src['name']}: no source could be fetched", flush=True)
                 continue
             for lic in clone.glob("[Ll][Ii][Cc][Ee][Nn][Ss][Ee]*"):
                 shutil.copy(lic, out / "licenses" / f"{src['name']}--{lic.name}")
+            stats[f"{src['name']} fetched from"] = fetched
             n = 0
             for doc in collect(src, clone):
                 fh.write(json.dumps(doc, ensure_ascii=False) + "\n")
                 n += 1
-                stats[f"{src['name']} docs"] += 1
-                stats[f"{src['name']} bytes"] += len(doc["text"].encode("utf-8"))
+                stats[f"{src['name']} docs"] = stats.get(f"{src['name']} docs", 0) + 1
+                stats[f"{src['name']} bytes"] = stats.get(f"{src['name']} bytes", 0) + len(doc["text"].encode("utf-8"))
             print(f"{src['name']}: {n} documents")
             if not args.keep_clones:
                 shutil.rmtree(clone)
+    tmp.rename(out / "docs.jsonl")  # only a complete file counts as done
     (out / "summary.json").write_text(json.dumps(dict(sorted(stats.items())), indent=2))
     print(json.dumps(dict(sorted(stats.items())), indent=2))
 
