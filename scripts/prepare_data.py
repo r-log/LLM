@@ -17,6 +17,10 @@ Sources:
                   repository becomes one document: its files in dependency order, each
                   preceded by a 0x1C byte (ASCII file separator) and its path. Validation
                   repositories are cut to their first --val-doc-bytes bytes.
+                  --add-docs FILE mixes documentation (scripts/build_docs_corpus.py) into the
+                  training stream, spread evenly between repositories (--docs-repeat N
+                  includes it N times). Output goes to data/code+docs. Validation stays
+                  pure code, so runs with and without docs are scored on the same text.
     pg19          PG-19: Project Gutenberg books from before 1919, ~400 KB each (long-range
                   text). Validation comes from the official validation split.
     stdlib        English docstrings from Python's own standard library (works offline;
@@ -99,6 +103,29 @@ def code_docs(split: str, raw_dir: str = "data/code-raw", max_bytes: int | None 
             yield doc
 
 
+def count_lines(path) -> int:
+    with open(path, encoding="utf-8") as fh:
+        return sum(1 for _ in fh)
+
+
+def mix_evenly(main_docs, n_main: int, extra: list[str], repeat: int, seed: int):
+    """Yield main_docs with the extra docs (repeated, shuffled) spread evenly in between.
+    Yields (doc, is_extra) pairs."""
+    import random
+
+    pool = extra * repeat
+    random.Random(seed).shuffle(pool)
+    D, used = len(pool), 0
+    for i, doc in enumerate(main_docs):
+        yield doc, False
+        k = (i + 1) * D // max(n_main, 1) - used
+        for d in pool[used:used + k]:
+            yield d, True
+        used += k
+    for d in pool[used:]:  # only if main_docs was shorter than n_main
+        yield d, True
+
+
 # source -> (default number of validation docs, validation iterator or None, train iterator)
 # With None, validation docs are taken from the start of the train iterator.
 SOURCES = {
@@ -118,6 +145,9 @@ def main():
     ap.add_argument("--out", default="data")
     ap.add_argument("--code-raw", default="data/code-raw", help="input folder for --source code")
     ap.add_argument("--val-doc-bytes", type=int, default=1_000_000, help="code: cut validation repos to this size")
+    ap.add_argument("--add-docs", help="code: documentation .jsonl to mix into training (see build_docs_corpus.py)")
+    ap.add_argument("--docs-repeat", type=int, default=1, help="include the documentation this many times")
+    ap.add_argument("--docs-seed", type=int, default=0)
     args = ap.parse_args()
 
     default_val, val_iter, train_iter = SOURCES[args.source]
@@ -125,7 +155,7 @@ def main():
         val_iter = lambda: code_docs("val", args.code_raw, args.val_doc_bytes)  # noqa: E731
         train_iter = lambda: code_docs("train", args.code_raw)  # noqa: E731
     n_val = args.val_docs or default_val
-    out = Path(args.out) / args.source
+    out = Path(args.out) / (args.source + ("+docs" if args.add_docs else ""))
     out.mkdir(parents=True, exist_ok=True)
     toks = []
     for name in args.tokenizers.split(","):
@@ -136,7 +166,15 @@ def main():
     if not toks:
         sys.exit("no usable tokenizer")
 
-    docs = train_iter()
+    if args.add_docs:
+        assert args.source == "code", "--add-docs is only supported with --source code"
+        with open(args.add_docs, encoding="utf-8") as fh:
+            extra = [json.loads(line)["text"] for line in fh]
+        n_main = count_lines(Path(args.code_raw) / "train.jsonl")
+        mixed = mix_evenly(train_iter(), n_main, extra, args.docs_repeat, args.docs_seed)
+    else:
+        mixed = ((d, False) for d in train_iter())
+    docs_bytes = 0
     files = {t.name: open(out / f"train_{t.name}.bin", "wb") for t in toks}
     counts = {t.name: 0 for t in toks}
     val, n_train_docs, n_train_bytes = [], 0, 0
@@ -154,7 +192,9 @@ def main():
                 np.concatenate(buffers[t.name]).tofile(files[t.name])
                 buffers[t.name].clear()
 
-    for doc in docs:
+    for doc, is_extra in mixed:
+        if is_extra:
+            docs_bytes += len(doc.encode("utf-8"))
         if val_iter is None and len(val) < n_val:  # with a separate validation split, never take train docs
             val.append(doc)
             continue
@@ -190,6 +230,7 @@ def main():
         "val_bytes": sum(len(d.encode("utf-8")) for d in val),
         "train_docs": n_train_docs,
         "train_bytes": n_train_bytes,
+        "train_docs_bytes": docs_bytes,
         "train_tokens": counts,
         "bytes_per_token": {k: n_train_bytes / max(v - n_train_docs, 1) for k, v in counts.items()},
     }
