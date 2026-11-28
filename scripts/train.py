@@ -51,7 +51,7 @@ PRESETS = {
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", required=True, help="folder made by prepare_data.py")
-    ap.add_argument("--tokenizer", choices=["bytes", "gpt2"], required=True)
+    ap.add_argument("--tokenizer", required=True, help="bytes, gpt2 or bpe-<name> (see scripts/train_tokenizer.py)")
     ap.add_argument("--preset", choices=PRESETS, default="small")
     ap.add_argument("--block-size", type=int, help="override the preset's context length")
     ap.add_argument("--n-layer", type=int, help="override the preset's number of layers")

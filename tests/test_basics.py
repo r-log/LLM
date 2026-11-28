@@ -168,3 +168,22 @@ def test_blocked_attention_matches_masked_attention():
     _, loss = m(x, x)
     loss.backward()
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in m.parameters())
+
+
+def test_bpe_tokenizer_round_trip_and_byte_counts(tmp_path):
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+    from llm.tokenizers import BPETokenizer
+    tok = Tokenizer(models.BPE())
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True)
+    tok.decoder = decoders.ByteLevel()
+    trainer = trainers.BpeTrainer(vocab_size=400, special_tokens=["<|eot|>"], show_progress=False,
+                                  initial_alphabet=pre_tokenizers.ByteLevel.alphabet())
+    tok.train_from_iterator(["int main(void) { return 0; }\n" * 50, "#include <stdio.h>\n" * 50], trainer)
+    tok.save(str(tmp_path / "t.json"))
+    t = BPETokenizer("bpe-t", tmp_path / "t.json")
+    assert t.eot_id == 0
+    for text in ["\x1csrc/a.c\nint x;\r\n\tif (p) { }", "Größe ünïcödé → 🚀", "  spaces   and\ttabs\n\n"]:
+        ids = t.encode(text)
+        assert t.decode(ids) == text
+        assert sum(t.token_bytes(ids)) == len(text.encode("utf-8"))
+        assert t.eot_id not in ids
