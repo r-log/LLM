@@ -187,3 +187,47 @@ def test_bpe_tokenizer_round_trip_and_byte_counts(tmp_path):
         assert t.decode(ids) == text
         assert sum(t.token_bytes(ids)) == len(text.encode("utf-8"))
         assert t.eot_id not in ids
+
+
+def _reading_setup():
+    from llm.reading import read_document
+    torch.manual_seed(0)
+    m = GPT(GPTConfig(vocab_size=257, block_size=32, n_layer=2, n_head=2, n_embd=32))
+    tok = ByteTokenizer()
+    doc = "int add(int a, int b) { return a + b; }\n" * 6
+    return m, tok, doc, [tok.eot_id] + tok.encode(doc), read_document
+
+
+def test_reading_static_matches_bits_per_byte():
+    from llm.reading import curve, bpb
+    m, tok, doc, ids, read_document = _reading_setup()
+    for stride in (None, 8):
+        nats, _ = read_document(m, ids, stride=stride)
+        c = curve(nats, ids, tok)
+        assert c["total"]["bytes"] == len(doc.encode())
+        assert math.isclose(bpb(c["total"]), bits_per_byte(m, [doc], tok, stride=stride)["bpb"], rel_tol=1e-5)
+
+
+def test_learning_while_reading_scores_before_updating():
+    import copy
+    m, tok, doc, ids, read_document = _reading_setup()
+    static, _ = read_document(copy.deepcopy(m), ids)
+    zero, _ = read_document(copy.deepcopy(m), ids, select="all", lr=0.0)
+    assert torch.allclose(static, zero)  # lr 0 == no learning
+    for select in ("all", "surprise", "random"):
+        adapted, updates = read_document(copy.deepcopy(m), ids, select=select, frac=0.25, lr=1e-2)
+        assert updates > 0
+        assert torch.allclose(static[:32], adapted[:32])  # first window: scored before any update
+        assert not torch.allclose(static[32:], adapted[32:])  # later windows: the model has learned
+    # learning on a repetitive text should help on later windows
+    adapted, _ = read_document(copy.deepcopy(m), ids, select="all", lr=1e-2)
+    assert adapted[64:].mean() < static[64:].mean()
+
+
+def test_reading_run_resets_model_and_measures_forgetting():
+    from llm.reading import run
+    m, tok, doc, ids, _ = _reading_setup()
+    before = {k: v.clone() for k, v in m.state_dict().items()}
+    res = run(m, [doc, doc[::-1]], tok, forget_docs=["some other text " * 4], select="all", lr=1e-2)
+    assert all(torch.equal(before[k], v) for k, v in m.state_dict().items())  # model restored
+    assert len(res["per_doc_bpb"]) == 2 and "forgetting" in res and res["updates"] > 0
