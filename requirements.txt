@@ -2,4 +2,5 @@ torch>=2.4
 numpy
 tiktoken
 datasets
+tokenizers
 pytest

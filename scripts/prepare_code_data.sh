@@ -24,6 +24,8 @@ DOCS_REPEAT=${DOCS_REPEAT:-1}
 TOKENIZERS=${TOKENIZERS:-bytes,bpe-code4k,bpe-code16k}
 say() { echo; echo "=== $(date '+%H:%M:%S') $* ==="; }
 
+pip install -q -r requirements.txt
+
 say "1/4 code corpus"
 if [ -f data/code-raw/train.jsonl ]; then echo "exists, skipping"; else
   [ -f data/code-raw/repos.json ] || python scripts/build_code_corpus.py search --scale "$SCALE"
